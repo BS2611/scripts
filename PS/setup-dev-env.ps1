@@ -188,16 +188,36 @@ function Confirm-Step {
 
 # ── Install one app via winget ────────────────────────────────
 function Install-App {
-    param([hashtable]$app)
+    param(
+        [hashtable]$app,
+        [int]$CurrentIndex = 1,
+        [int]$TotalCount = 1
+    )
+
+    $safeTotal = if ($TotalCount -gt 0) { $TotalCount } else { 1 }
+    $percent = [int]((($CurrentIndex - 1) / $safeTotal) * 100)
+
+    Write-Progress -Activity "Installing Applications" `
+                   -Status "Checking $($app.name) ($CurrentIndex of $safeTotal)" `
+                   -PercentComplete $percent
+
     $check = winget list --id $app.id --exact 2>$null | Select-String $app.id
     if ($check) {
         Write-Skip "Already installed: $($app.name)"
         Write-Log "SKIP: $($app.name)"
         return
     }
+
+    Write-Progress -Activity "Installing Applications" `
+                   -Status "Installing $($app.name) ($CurrentIndex of $safeTotal)" `
+                   -PercentComplete $percent
+
     Write-Step "Installing $($app.name)..."
+    Write-Host "  -> Package ID: $($app.id)" -ForegroundColor DarkGray
+
     winget install --id $app.id --exact --silent `
-        --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+        --accept-package-agreements --accept-source-agreements
+
     if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
         Write-Ok "Installed: $($app.name)"
         Write-Log "OK: $($app.name)"
@@ -331,7 +351,10 @@ if (-not (Confirm-Step "Start setup now?")) {
 
 # -- Install apps ─────────────────────────────────────────────
 Write-Header "Installing Applications  ($($appsToInstall.Count) selected)"
-foreach ($app in $appsToInstall) { Install-App $app }
+for ($appIndex = 0; $appIndex -lt $appsToInstall.Count; $appIndex++) {
+    Install-App -app $appsToInstall[$appIndex] -CurrentIndex ($appIndex + 1) -TotalCount $appsToInstall.Count
+}
+Write-Progress -Activity "Installing Applications" -Completed
 
 # -- Apply Windows dev settings ───────────────────────────────
 Write-Header "Applying Developer Settings"
