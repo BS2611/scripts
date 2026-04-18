@@ -7,6 +7,14 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "SilentlyContinue"
 
+# winget writes animated progress to the console; piping it to Out-Null (or into
+# PowerShell cmdlets) often looks "stuck" or actually deadlocks. Always run
+# winget via Start-Process, or with no stdout/stderr redirection.
+$script:WingetCommonArgs = @(
+    '--disable-interactivity'
+    '--accept-source-agreements'
+)
+
 # ── Colour helpers ───────────────────────────────────────────
 function Write-Banner {
     Clear-Host
@@ -186,44 +194,60 @@ function Confirm-Step {
     return $r -match "^[Yy]"
 }
 
+# ── Run winget without pipeline redirection (avoids hangs) ───
+function Invoke-WingetProcess {
+    param(
+        [Parameter(Mandatory)][string[]] $Arguments,
+        [switch] $CaptureOutput
+    )
+    if ($CaptureOutput) {
+        $out = Join-Path $env:TEMP ("winget-out-{0}.txt" -f [Guid]::NewGuid().ToString('n'))
+        $err = Join-Path $env:TEMP ("winget-err-{0}.txt" -f [Guid]::NewGuid().ToString('n'))
+        try {
+            $p = Start-Process -FilePath 'winget' -ArgumentList $Arguments -Wait -PassThru -NoNewWindow `
+                -RedirectStandardOutput $out -RedirectStandardError $err
+            $stdout = Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue
+            $stderr = Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue
+            return [PSCustomObject]@{
+                ExitCode = $p.ExitCode
+                Output   = ($stdout + $stderr)
+            }
+        } finally {
+            Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue
+        }
+    }
+
+    $p = Start-Process -FilePath 'winget' -ArgumentList $Arguments -Wait -PassThru -NoNewWindow
+    return [PSCustomObject]@{ ExitCode = $p.ExitCode; Output = $null }
+}
+
 # ── Install one app via winget ────────────────────────────────
 function Install-App {
-    param(
-        [hashtable]$app,
-        [int]$CurrentIndex = 1,
-        [int]$TotalCount = 1
-    )
-
-    $safeTotal = if ($TotalCount -gt 0) { $TotalCount } else { 1 }
-    $percent = [int]((($CurrentIndex - 1) / $safeTotal) * 100)
-
-    Write-Progress -Activity "Installing Applications" `
-                   -Status "Checking $($app.name) ($CurrentIndex of $safeTotal)" `
-                   -PercentComplete $percent
-
-    $check = winget list --id $app.id --exact 2>$null | Select-String $app.id
-    if ($check) {
+    param([hashtable]$app)
+    $listArgs = @(
+        'list', '--id', $app.id, '--exact'
+    ) + $script:WingetCommonArgs
+    $listResult = Invoke-WingetProcess -Arguments $listArgs -CaptureOutput
+    if ($listResult.ExitCode -eq 0 -and ($listResult.Output -match [regex]::Escape($app.id))) {
         Write-Skip "Already installed: $($app.name)"
         Write-Log "SKIP: $($app.name)"
         return
     }
 
-    Write-Progress -Activity "Installing Applications" `
-                   -Status "Installing $($app.name) ($CurrentIndex of $safeTotal)" `
-                   -PercentComplete $percent
-
     Write-Step "Installing $($app.name)..."
-    Write-Host "  -> Package ID: $($app.id)" -ForegroundColor DarkGray
-
-    winget install --id $app.id --exact --silent `
-        --accept-package-agreements --accept-source-agreements
-
-    if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
+    $installArgs = @(
+        'install', '--id', $app.id, '--exact', '--silent',
+        '--accept-package-agreements'
+    ) + $script:WingetCommonArgs
+    $inst = Invoke-WingetProcess -Arguments $installArgs -CaptureOutput
+    $code = $inst.ExitCode
+    if ($code -eq 0 -or $code -eq -1978335189) {
         Write-Ok "Installed: $($app.name)"
         Write-Log "OK: $($app.name)"
     } else {
-        Write-Fail "Failed: $($app.name)  (exit $LASTEXITCODE)"
-        Write-Log "FAIL: $($app.name) exit=$LASTEXITCODE"
+        Write-Fail "Failed: $($app.name)  (exit $code)"
+        Write-Log "FAIL: $($app.name) exit=$code"
+        if ($inst.Output) { Write-Log ($inst.Output.Trim()) }
     }
 }
 
@@ -247,11 +271,23 @@ function Apply-Setting {
 Write-Banner
 Write-Log "=== Dev Setup Started at $(Get-Date) ==="
 
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Fail "winget was not found. Install App Installer from the Microsoft Store, then run this script again."
+    Write-Log "FAIL: winget missing"
+    exit 1
+}
+
 # ── 1. Refresh winget ────────────────────────────────────────
 Write-Header "Step 1  --  Update Package Sources"
-Write-Step "Refreshing winget sources..."
-winget source update | Out-Null
-Write-Ok "Sources up to date"
+Write-Step "Refreshing winget sources (progress will appear below; first run can take several minutes)..."
+$srcArgs = @('source', 'update') + $script:WingetCommonArgs
+$src = Invoke-WingetProcess -Arguments $srcArgs
+if ($src.ExitCode -eq 0) {
+    Write-Ok "Sources up to date"
+} else {
+    Write-Warn "winget source update finished with exit $($src.ExitCode); continuing anyway."
+    Write-Log "WARN: winget source update exit=$($src.ExitCode)"
+}
 
 # ── 2. Choose categories ─────────────────────────────────────
 $catNames = @($AppCategories.Keys)
@@ -351,10 +387,7 @@ if (-not (Confirm-Step "Start setup now?")) {
 
 # -- Install apps ─────────────────────────────────────────────
 Write-Header "Installing Applications  ($($appsToInstall.Count) selected)"
-for ($appIndex = 0; $appIndex -lt $appsToInstall.Count; $appIndex++) {
-    Install-App -app $appsToInstall[$appIndex] -CurrentIndex ($appIndex + 1) -TotalCount $appsToInstall.Count
-}
-Write-Progress -Activity "Installing Applications" -Completed
+foreach ($app in $appsToInstall) { Install-App $app }
 
 # -- Apply Windows dev settings ───────────────────────────────
 Write-Header "Applying Developer Settings"
